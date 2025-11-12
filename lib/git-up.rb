@@ -21,10 +21,20 @@ class GitUp
     
     @remote_map = nil # flush cache after fetch
 
+    # Decide whether to use Git's --autostash or fall back to manual stash/pop
+    use_autostash = (config("rebase.autostash") != 'false') && supports_autostash?
+
     Grit::Git.with_timeout(0) do
-      with_stash do
+      if use_autostash
+        # skip manual stashing because --autostash will handle it
         returning_to_current_branch do
-          rebase_all_branches
+          rebase_all_branches(use_autostash: true)
+        end
+      else
+        with_stash do
+          returning_to_current_branch do
+            rebase_all_branches
+          end
         end
       end
     end
@@ -99,7 +109,7 @@ BANNER
     end
   end
 
-  def rebase_all_branches
+  def rebase_all_branches(options = {})
     col_width = branches.map { |b| b.name.length }.max + 1
 
     branches.each do |branch|
@@ -135,7 +145,7 @@ BANNER
 
       log(branch, remote)
       checkout(branch.name)
-      rebase(remote)
+      rebase(remote, options)
     end
   end
 
@@ -226,9 +236,14 @@ BANNER
     end
   end
 
-  def rebase(target_branch)
+  def rebase(target_branch, options = {})
     current_branch = repo.head
     arguments = config("rebase.arguments")
+
+    # Append --autostash if requested and not already present
+    if options[:use_autostash] && !arguments.to_s.include?('--autostash')
+      arguments = "#{arguments} --autostash".strip
+    end
 
     output, err = repo.git.sh("#{Grit::Git.git_binary} rebase #{arguments} #{target_branch.name}")
 
@@ -350,6 +365,10 @@ EOS
 
   def git_version
     `git --version`[/\d+(\.\d+)+/]
+  end
+
+  def supports_autostash?
+    git_version_at_least?("2.9.0")
   end
 end
 
