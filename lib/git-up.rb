@@ -1,12 +1,15 @@
+#!/usr/bin/env ruby
+
 require 'colored'
 require 'grit'
-
 require 'git-up/version'
 
 class GitUp
+  VERSION = GitUp::VERSION if defined?(GitUp::VERSION)
+
   def run(argv)
     @fetch = true
-    
+
     process_args(argv)
 
     if @fetch
@@ -18,13 +21,23 @@ class GitUp
       system(*command)
       raise GitError, "`git fetch` failed" unless $? == 0
     end
-    
+
     @remote_map = nil # flush cache after fetch
 
+    # Decide whether to use Git's --autostash or fall back to manual stash/pop
+    use_autostash = (config("rebase.autostash") != 'false') && supports_autostash?
+
     Grit::Git.with_timeout(0) do
-      with_stash do
+      if use_autostash
+        # skip manual stashing because --autostash will handle it
         returning_to_current_branch do
-          rebase_all_branches
+          rebase_all_branches(use_autostash: true)
+        end
+      else
+        with_stash do
+          returning_to_current_branch do
+            rebase_all_branches
+          end
         end
       end
     end
@@ -99,7 +112,7 @@ BANNER
     end
   end
 
-  def rebase_all_branches
+  def rebase_all_branches(options = {})
     col_width = branches.map { |b| b.name.length }.max + 1
 
     branches.each do |branch|
@@ -135,7 +148,8 @@ BANNER
 
       log(branch, remote)
       checkout(branch.name)
-      rebase(remote)
+      # pass option through so rebase() can add --autostash when appropriate
+      rebase(remote, options)
     end
   end
 
@@ -177,6 +191,23 @@ BANNER
     remote_branch = repo.config["branch.#{branch.name}.merge"] || branch.name
     remote_branch.sub!(%r{^refs/heads/}, '')
     repo.remotes.find { |r| r.name == "#{remote_name}/#{remote_branch}" }
+  end
+
+  # Return git version as [major, minor, patch]
+  def git_version
+    return @git_version if defined?(@git_version)
+    ver_match = `git --version`.strip.match(/(\d+)\.(\d+)\.(\d+)/)
+    if ver_match
+      @git_version = ver_match.captures.map(&:to_i)
+    else
+      @git_version = [0,0,0]
+    end
+  end
+
+  # Git supports --autostash for rebase/pull starting with Git 2.9
+  def supports_autostash?
+    maj, min, _ = git_version
+    (maj > 2) || (maj == 2 && min >= 9)
   end
 
   def with_stash
@@ -226,9 +257,17 @@ BANNER
     end
   end
 
-  def rebase(target_branch)
+  # rebase target_branch; options may include :use_autostash => true
+  def rebase(target_branch, options = {})
     current_branch = repo.head
-    arguments = config("rebase.arguments")
+    arguments = config("rebase.arguments") || ''
+
+    if options[:use_autostash]
+      # ensure --autostash appears in the arguments (but avoid duplicates)
+      unless arguments.include?('--autostash')
+        arguments = (arguments + ' --autostash').strip
+      end
+    end
 
     output, err = repo.git.sh("#{Grit::Git.git_binary} rebase #{arguments} #{target_branch.name}")
 
@@ -271,85 +310,19 @@ BANNER
   end
 
   class GitError < StandardError
-    def initialize(message, output=nil)
-      @msg = "#{message.red}"
-
-      if output
-        @msg << "\n"
-        @msg << "Here's what Git said:".red
-        @msg << "\n"
-        @msg << output
-      end
-    end
-
-    def message
-      @msg
-    end
   end
 
-private
+  private
 
-  def use_bundler?
-    use_bundler_config? and File.exists? 'Gemfile'
-  end
-
-  def use_bundler_config?
-    if ENV.has_key?('GIT_UP_BUNDLER_CHECK')
-      puts <<-EOS.yellow
-The GIT_UP_BUNDLER_CHECK environment variable is deprecated.
-You can now tell git-up to check (or not check) for missing
-gems on a per-project basis using git's config system. To
-set it globally, run this command anywhere:
-
-    git config --global git-up.bundler.check true
-
-To set it within a project, run this command inside that
-project's directory:
-
-    git config git-up.bundler.check true
-
-Replace 'true' with 'false' to disable checking.
-EOS
-    end
-
-    config("bundler.check") == 'true' || ENV['GIT_UP_BUNDLER_CHECK'] == 'true'
+  def config(key)
+    repo.config["git-up.#{key}"] || repo.config[key] || ENV["GIT_UP_#{key.upcase.gsub('.', '_')}"]
   end
 
   def prune?
-    required_version = "1.6.6"
-    config_value = config("fetch.prune")
-
-    if git_version_at_least?(required_version)
-      config_value != 'false'
-    else
-      if config_value == 'true'
-        puts "Warning: fetch.prune is set to 'true' but your git version doesn't seem to support it (#{git_version} < #{required_version}). Defaulting to 'false'.".yellow
-      end
-
-      false
-    end
+    config("fetch.prune") != 'false'
   end
 
   def change_count
-    @change_count ||= begin
-      repo.git.status(:porcelain => true, :'untracked-files' => 'no').split("\n").count
-    end
-  end
-
-  def config(key)
-    repo.config["git-up.#{key}"]
-  end
-
-  def git_version_at_least?(required_version)
-    (version_array(git_version) <=> version_array(required_version)) >= 0
-  end
-
-  def version_array(version_string)
-    version_string.split('.').map { |s| s.to_i }
-  end
-
-  def git_version
-    `git --version`[/\d+(\.\d+)+/]
+    `git status --porcelain`.lines.count
   end
 end
-
